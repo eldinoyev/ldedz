@@ -5,7 +5,7 @@ use crate::{
 use agent_client_protocol::schema as acp;
 use std::cell::RefCell;
 
-use acp_thread::{ContentBlock, PlanEntry};
+use acp_thread::{ContentBlock, PlanEntry, TOKEN_USAGE_WARNING_THRESHOLD};
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
 use feature_flags::AcpBetaFeatureFlag;
@@ -3284,6 +3284,7 @@ impl ThreadView {
                                         Some(config_view) => this.child(config_view),
                                         None => this
                                             .children(self.mode_selector.clone())
+                                            .children(self.render_context_usage_label(cx))
                                             .children(self.model_selector.clone()),
                                     })
                                     .child(self.render_send_button(cx)),
@@ -3672,6 +3673,27 @@ impl ThreadView {
                     .into_any_element(),
             )
         }
+    }
+
+    fn render_context_usage_label(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let thread = self.thread.read(cx);
+        let usage = thread.token_usage()?;
+        if usage.max_tokens == 0 {
+            return None;
+        }
+        let used = crate::humanize_token_count(usage.used_tokens);
+        let max = crate::humanize_token_count(usage.max_tokens);
+        let ratio = usage.used_tokens as f32 / usage.max_tokens as f32;
+        let color = if ratio >= TOKEN_USAGE_WARNING_THRESHOLD {
+            Color::Warning
+        } else {
+            Color::Muted
+        };
+        Some(
+            Label::new(format!("{} / {}", used, max))
+                .size(LabelSize::Small)
+                .color(color),
+        )
     }
 
     fn fast_mode_available(&self, cx: &Context<Self>) -> bool {
