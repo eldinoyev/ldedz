@@ -11,11 +11,10 @@ use std::{
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema as acp;
-use agent_servers::AgentServer;
+use agent_servers::{AgentServer, CLAUDE_AGENT_ID};
+use project::AgentId;
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
-use itertools::Itertools;
-use project::AgentId;
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelProviderSetting, LanguageModelSelection};
 
@@ -73,7 +72,7 @@ use terminal::terminal_settings::TerminalSettings;
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use theme_settings::ThemeSettings;
 use ui::{
-    Button, ContextMenu, ContextMenuEntry, IconButton, PopoverMenu, PopoverMenuHandle, Tab,
+    Button, ContextMenu, IconButton, PopoverMenu, PopoverMenuHandle, Tab,
     Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
@@ -1058,7 +1057,9 @@ impl AgentPanel {
             pending_serialization: None,
             new_user_onboarding: onboarding,
             thread_store,
-            selected_agent: Agent::default(),
+            selected_agent: Agent::Custom {
+                id: AgentId(CLAUDE_AGENT_ID.into()),
+            },
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
@@ -2906,202 +2907,19 @@ impl AgentPanel {
                 let store = agent_server_store.read(cx);
                 let icon = store.agent_icon(&id);
 
-                let label = store
-                    .agent_display_name(&id)
-                    .unwrap_or_else(|| self.selected_agent.label());
+                let label = if id.0.as_ref() == CLAUDE_AGENT_ID {
+                    "Claude Code".into()
+                } else {
+                    store
+                        .agent_display_name(&id)
+                        .unwrap_or_else(|| self.selected_agent.label())
+                };
                 (icon, label)
             } else {
                 (None, self.selected_agent.label())
             };
 
-        let active_thread = match &self.base_view {
-            BaseView::AgentThread { conversation_view } => {
-                conversation_view.read(cx).as_native_thread(cx)
-            }
-            BaseView::Uninitialized => None,
-        };
 
-        let new_thread_menu_builder: Rc<
-            dyn Fn(&mut Window, &mut App) -> Option<Entity<ContextMenu>>,
-        > = {
-            let selected_agent = self.selected_agent.clone();
-            let is_agent_selected = move |agent: Agent| selected_agent == agent;
-
-            let workspace = self.workspace.clone();
-            let is_via_collab = workspace
-                .update(cx, |workspace, cx| {
-                    workspace.project().read(cx).is_via_collab()
-                })
-                .unwrap_or_default();
-
-            let focus_handle = focus_handle.clone();
-            let agent_server_store = agent_server_store;
-
-            Rc::new(move |window, cx| {
-                let active_thread = active_thread.clone();
-                Some(ContextMenu::build(window, cx, |menu, _window, cx| {
-                    menu.context(focus_handle.clone())
-                        .when_some(active_thread, |this, active_thread| {
-                            let thread = active_thread.read(cx);
-
-                            if !thread.is_empty() {
-                                let session_id = thread.id().clone();
-                                this.item(
-                                    ContextMenuEntry::new("New From Summary")
-                                        .icon(IconName::ThreadFromSummary)
-                                        .icon_color(Color::Muted)
-                                        .handler(move |window, cx| {
-                                            window.dispatch_action(
-                                                Box::new(NewNativeAgentThreadFromSummary {
-                                                    from_session_id: session_id.clone(),
-                                                }),
-                                                cx,
-                                            );
-                                        }),
-                                )
-                            } else {
-                                this
-                            }
-                        })
-                        .item(
-                            ContextMenuEntry::new("Zed Agent")
-                                .when(is_agent_selected(Agent::NativeAgent), |this| {
-                                    this.action(Box::new(NewExternalAgentThread { agent: None }))
-                                })
-                                .icon(IconName::ZedAgent)
-                                .icon_color(Color::Muted)
-                                .handler({
-                                    let workspace = workspace.clone();
-                                    move |window, cx| {
-                                        if let Some(workspace) = workspace.upgrade() {
-                                            workspace.update(cx, |workspace, cx| {
-                                                if let Some(panel) =
-                                                    workspace.panel::<AgentPanel>(cx)
-                                                {
-                                                    panel.update(cx, |panel, cx| {
-                                                        panel.new_external_agent_thread(
-                                                            &NewExternalAgentThread {
-                                                                agent: Some(Agent::NativeAgent),
-                                                            },
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }
-                                            });
-                                        }
-                                    }
-                                }),
-                        )
-                        .map(|mut menu| {
-                            let agent_server_store = agent_server_store.read(cx);
-                            let registry_store = project::AgentRegistryStore::try_global(cx);
-                            let registry_store_ref = registry_store.as_ref().map(|s| s.read(cx));
-
-                            struct AgentMenuItem {
-                                id: AgentId,
-                                display_name: SharedString,
-                            }
-
-                            let agent_items = agent_server_store
-                                .external_agents()
-                                .map(|agent_id| {
-                                    let display_name = agent_server_store
-                                        .agent_display_name(agent_id)
-                                        .or_else(|| {
-                                            registry_store_ref
-                                                .as_ref()
-                                                .and_then(|store| store.agent(agent_id))
-                                                .map(|a| a.name().clone())
-                                        })
-                                        .unwrap_or_else(|| agent_id.0.clone());
-                                    AgentMenuItem {
-                                        id: agent_id.clone(),
-                                        display_name,
-                                    }
-                                })
-                                .sorted_unstable_by_key(|e| e.display_name.to_lowercase())
-                                .collect::<Vec<_>>();
-
-                            if !agent_items.is_empty() {
-                                menu = menu.separator().header("External Agents");
-                            }
-                            for item in &agent_items {
-                                let mut entry = ContextMenuEntry::new(item.display_name.clone());
-
-                                let icon_path =
-                                    agent_server_store.agent_icon(&item.id).or_else(|| {
-                                        registry_store_ref
-                                            .as_ref()
-                                            .and_then(|store| store.agent(&item.id))
-                                            .and_then(|a| a.icon_path().cloned())
-                                    });
-
-                                if let Some(icon_path) = icon_path {
-                                    entry = entry.custom_icon_svg(icon_path);
-                                } else {
-                                    entry = entry.icon(IconName::Sparkle);
-                                }
-
-                                entry = entry
-                                    .when(
-                                        is_agent_selected(Agent::Custom {
-                                            id: item.id.clone(),
-                                        }),
-                                        |this| {
-                                            this.action(Box::new(NewExternalAgentThread {
-                                                agent: None,
-                                            }))
-                                        },
-                                    )
-                                    .icon_color(Color::Muted)
-                                    .disabled(is_via_collab)
-                                    .handler({
-                                        let workspace = workspace.clone();
-                                        let agent_id = item.id.clone();
-                                        move |window, cx| {
-                                            if let Some(workspace) = workspace.upgrade() {
-                                                workspace.update(cx, |workspace, cx| {
-                                                    if let Some(panel) =
-                                                        workspace.panel::<AgentPanel>(cx)
-                                                    {
-                                                        panel.update(cx, |panel, cx| {
-                                                            panel.new_external_agent_thread(
-                                                                &NewExternalAgentThread {
-                                                                    agent: Some(Agent::Custom {
-                                                                        id: agent_id.clone(),
-                                                                    }),
-                                                                },
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }
-                                                });
-                                            }
-                                        }
-                                    });
-
-                                menu = menu.item(entry);
-                            }
-
-                            menu
-                        })
-                        .separator()
-                        .item(
-                            ContextMenuEntry::new("Add More Agents")
-                                .icon(IconName::Plus)
-                                .icon_color(Color::Muted)
-                                .handler({
-                                    move |window, cx| {
-                                        window
-                                            .dispatch_action(Box::new(zed_actions::AcpRegistry), cx)
-                                    }
-                                }),
-                        )
-                }))
-            })
-        };
 
         let is_thread_loading = self
             .active_conversation_view()
@@ -3185,52 +3003,29 @@ impl AgentPanel {
             .gap_2();
 
         let toolbar_content = if use_v2_empty_toolbar {
-            let (chevron_icon, icon_color, label_color) =
-                if self.new_thread_menu_handle.is_deployed() {
-                    (IconName::ChevronUp, Color::Accent, Color::Accent)
-                } else {
-                    (IconName::ChevronDown, Color::Muted, Color::Default)
-                };
-
             let agent_icon = if let Some(icon_path) = selected_agent_custom_icon_for_button {
                 Icon::from_external_svg(icon_path)
                     .size(IconSize::Small)
-                    .color(icon_color)
+                    .color(Color::Muted)
             } else {
                 let icon_name = selected_agent_builtin_icon.unwrap_or(IconName::ZedAgent);
-                Icon::new(icon_name).size(IconSize::Small).color(icon_color)
+                Icon::new(icon_name).size(IconSize::Small).color(Color::Muted)
             };
 
-            let agent_selector_button = Button::new("agent-selector-trigger", selected_agent_label)
+            let agent_button = Button::new("agent-selector-trigger", selected_agent_label)
                 .start_icon(agent_icon)
-                .color(label_color)
-                .end_icon(
-                    Icon::new(chevron_icon)
-                        .color(icon_color)
-                        .size(IconSize::XSmall),
-                );
-
-            let agent_selector_menu = PopoverMenu::new("new_thread_menu")
-                .trigger_with_tooltip(agent_selector_button, {
-                    move |_window, cx| {
-                        Tooltip::for_action_in(
-                            "New Thread…",
-                            &ToggleNewThreadMenu,
-                            &focus_handle,
-                            cx,
-                        )
-                    }
-                })
-                .menu({
-                    let builder = new_thread_menu_builder.clone();
-                    move |window, cx| builder(window, cx)
-                })
-                .with_handle(self.new_thread_menu_handle.clone())
-                .anchor(Anchor::TopLeft)
-                .offset(gpui::Point {
-                    x: px(1.0),
-                    y: px(1.0),
-                });
+                .color(Color::Default)
+                .on_click(cx.listener(|panel, _, window, cx| {
+                    panel.new_external_agent_thread(
+                        &NewExternalAgentThread {
+                            agent: Some(Agent::Custom {
+                                id: AgentId(CLAUDE_AGENT_ID.into()),
+                            }),
+                        },
+                        window,
+                        cx,
+                    );
+                }));
 
             base_container
                 .child(
@@ -3238,7 +3033,7 @@ impl AgentPanel {
                         .size_full()
                         .gap(DynamicSpacing::Base04.rems(cx))
                         .pl(DynamicSpacing::Base04.rems(cx))
-                        .child(agent_selector_menu),
+                        .child(agent_button),
                 )
                 .child(
                     h_flex()
@@ -3252,24 +3047,29 @@ impl AgentPanel {
                 )
                 .into_any_element()
         } else {
-            let new_thread_menu = PopoverMenu::new("new_thread_menu")
-                .trigger_with_tooltip(
-                    IconButton::new("new_thread_menu_btn", IconName::Plus)
-                        .icon_size(IconSize::Small),
-                    {
-                        move |_window, cx| {
-                            Tooltip::for_action_in(
-                                "New Thread\u{2026}",
-                                &ToggleNewThreadMenu,
-                                &focus_handle,
-                                cx,
-                            )
-                        }
-                    },
-                )
-                .anchor(Anchor::TopRight)
-                .with_handle(self.new_thread_menu_handle.clone())
-                .menu(move |window, cx| new_thread_menu_builder(window, cx));
+            let new_thread_button = IconButton::new("new_thread_btn", IconName::Plus)
+                .icon_size(IconSize::Small)
+                .tooltip({
+                    move |_window, cx| {
+                        Tooltip::for_action_in(
+                            "New Thread",
+                            &ToggleNewThreadMenu,
+                            &focus_handle,
+                            cx,
+                        )
+                    }
+                })
+                .on_click(cx.listener(|panel, _, window, cx| {
+                    panel.new_external_agent_thread(
+                        &NewExternalAgentThread {
+                            agent: Some(Agent::Custom {
+                                id: AgentId(CLAUDE_AGENT_ID.into()),
+                            }),
+                        },
+                        window,
+                        cx,
+                    );
+                }));
 
             base_container
                 .child(
@@ -3291,7 +3091,7 @@ impl AgentPanel {
                         .gap_1()
                         .pl_1()
                         .pr_1()
-                        .child(new_thread_menu)
+                        .child(new_thread_button)
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
