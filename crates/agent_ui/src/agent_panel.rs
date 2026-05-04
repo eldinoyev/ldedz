@@ -16,7 +16,6 @@ use project::AgentId;
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelProviderSetting, LanguageModelSelection};
 
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
@@ -37,7 +36,7 @@ use crate::{
     InlineAssistant, LoadThreadFromClipboard, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff,
     ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
     ToggleNewThreadMenu, ToggleOptionsMenu,
-    agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
+    agent_configuration::AgentConfiguration,
     conversation_view::{AcpThreadViewEvent, ThreadView},
     ui::EndTrialUpsell,
 };
@@ -1567,14 +1566,6 @@ impl AgentPanel {
             )
         }));
 
-        if let Some(configuration) = self.configuration.as_ref() {
-            self.configuration_subscription = Some(cx.subscribe_in(
-                configuration,
-                window,
-                Self::handle_agent_configuration_event,
-            ));
-        }
-
         self.set_overlay(OverlayView::Configuration, true, window, cx);
 
         if let Some(configuration) = self.configuration.as_ref() {
@@ -1836,52 +1827,6 @@ impl AgentPanel {
             .detach_and_log_err(cx);
     }
 
-    fn handle_agent_configuration_event(
-        &mut self,
-        _entity: &Entity<AgentConfiguration>,
-        event: &AssistantConfigurationEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            AssistantConfigurationEvent::NewThread(provider) => {
-                if LanguageModelRegistry::read_global(cx)
-                    .default_model()
-                    .is_none_or(|model| model.provider.id() != provider.id())
-                    && let Some(model) = provider.default_model(cx)
-                {
-                    update_settings_file(self.fs.clone(), cx, move |settings, _| {
-                        let provider = model.provider_id().0.to_string();
-                        let enable_thinking = model.supports_thinking();
-                        let effort = model
-                            .default_effort_level()
-                            .map(|effort| effort.value.to_string());
-                        let model = model.id().0.to_string();
-                        settings
-                            .agent
-                            .get_or_insert_default()
-                            .set_model(LanguageModelSelection {
-                                provider: LanguageModelProviderSetting(provider),
-                                model,
-                                enable_thinking,
-                                effort,
-                                speed: None,
-                            })
-                    });
-                }
-
-                self.new_thread(&NewThread, window, cx);
-                if let Some((thread, model)) = self
-                    .active_native_agent_thread(cx)
-                    .zip(provider.default_model(cx))
-                {
-                    thread.update(cx, |thread, cx| {
-                        thread.set_model(model, cx);
-                    });
-                }
-            }
-        }
-    }
 
     pub fn workspace_id(&self) -> Option<WorkspaceId> {
         self.workspace_id
